@@ -14,7 +14,3 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
-
-# Data artifacts generated at runtime
-Dataset/cardio_clean.csv
-Dataset/figures/
