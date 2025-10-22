@@ -1,94 +1,201 @@
-from __future__ import annotations
-
+from __future__ import annotations                 
+import argparse
 from pathlib import Path
-from typing import Dict, Tuple
-
-import matplotlib.pyplot as plt
+import warnings
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+
+
+
+def load_raw(path: Path) -> pd.DataFrame:                               # main cleaning functions                 
+    df = pd.read_csv(path, sep=";")
+    df.columns = [c.strip().lower() for c in df.columns]        # normalize column names    
+    return df
+
+
+def basic_sanity_fixes(df: pd.DataFrame) -> pd.DataFrame:
+    if "age" in df.columns:                                  # Convert age from days to years
+        df["age"] = (df["age"] / 365.25).astype(int)
+
+    if {"ap_hi", "ap_lo"}.issubset(df.columns):          # Some rows have swapped BP (ap_hi < ap_lo) -> swap them back
+        swapped = df["ap_hi"] < df["ap_lo"]
+        df.loc[swapped, ["ap_hi", "ap_lo"]] = df.loc[swapped, ["ap_lo", "ap_hi"]].values
+
+
+    rules = [                                             # Remove blatantly impossible entries (keep ranges a bit generous)
+        ("age", 30, 80),
+        ("height", 130, 210),                                       # cm
+        ("weight", 40, 200),                                       # kg
+        ("ap_hi", 80, 240),
+        ("ap_lo", 40, 150),
+    ]
+    for col, lo, hi in rules:
+        if col in df.columns:
+            df = df[(df[col] >= lo) & (df[col] <= hi)]
+
+
+    df = df.drop_duplicates(ignore_index=True)            # Drop duplicates
+    return df
+
+
+
+
+"""feature engineering for the dataset."""
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    if {"height", "weight"}.issubset(df.columns):           # BMI
+        h_m = df["height"] / 100.0
+        df["bmi"] = (df["weight"] / (h_m ** 2)).round(3)
+
+    if {"ap_hi", "ap_lo"}.issubset(df.columns):           # Pulse pressure
+        df["pulse_pressure"] = (df["ap_hi"] - df["ap_lo"]).astype(int)
+
+    if "age" in df.columns:                 # Age groups
+        df["age_group"] = pd.cut(
+            df["age"],
+            bins=[29, 39, 49, 59, 69, 120],
+            labels=["30s", "40s", "50s", "60s", "70+"],
+        )
+
+    for c in ["gender", "cholesterol", "gluc", "smoke", "alco", "active"]:                  # Ensure expected categoricals are categorical dtype
+        if c in df.columns:
+            df[c] = df[c].astype("category")
+
+    return df
+
+
+def impute_and_scale(df: pd.DataFrame, columns_to_scale: list[str]) -> tuple[pd.DataFrame, StandardScaler]:  #    (Light) imputation + standardization for numeric columns.
+
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()        # any NaNs left, fill numerics with median
+    for c in num_cols:
+        if df[c].isna().any():
+            df[c] = df[c].fillna(df[c].median())
+
+    scaler = StandardScaler()
+    cols = [c for c in columns_to_scale if c in df.columns]
+    if cols:
+        df[cols] = scaler.fit_transform(df[cols])
+    return df, scaler
+
+
+# Exploratory Data Analysis
+
+def save_class_balance(df: pd.DataFrame, figdir: Path, target: str = "cardio") -> None:          # plot and save class balance for target variable                           
+    if target not in df.columns:
+        warnings.warn(f"Target column '{target}' not found; skipping class balance plot.")                                          
+        return
+    figdir.mkdir(parents=True, exist_ok=True)
+    ax = df[target].value_counts().sort_index().plot(kind="bar")
+    ax.set_title("Target distribution (cardio)")
+    ax.set_xlabel("cardio (0 = no CVD, 1 = CVD)")
+    ax.set_ylabel("count")
+    plt.tight_layout()
+    plt.savefig(figdir / "01_target_distribution.png", dpi=160)
+    plt.close()
+
+
+def class_ratio(df: pd.DataFrame, target: str = "cardio") -> dict:                      # return class counts and positive-class percentage for target
+    if target not in df.columns:
+        return {"total": 0, "pos": 0, "neg": 0, "pos_pct": np.nan}
+    vc = df[target].value_counts()
+    pos = int(vc.get(1, 0))
+    neg = int(vc.get(0, 0))
+    total = pos + neg
+    pos_pct = round(100.0 * pos / total, 2) if total else np.nan
+    return {"total": total, "pos": pos, "neg": neg, "pos_pct": pos_pct}
+
+
+def save_histograms(df: pd.DataFrame, figdir: Path, cols: list[str]) -> None:               # made histograms for specified columns
+    figdir.mkdir(parents=True, exist_ok=True)
+    for c in cols:
+        if c in df.columns:
+            df[c].hist(bins=30)
+            plt.title(f"Distribution: {c}")
+            plt.xlabel(c)
+            plt.ylabel("count")
+            plt.tight_layout()
+            plt.savefig(figdir / f"hist_{c}.png", dpi=160)
+            plt.close()
+
+
+def save_corr_heatmap(df: pd.DataFrame, figdir: Path, target_first: bool = True) -> None:            # correlation heatmap for numeric columns
+    figdir.mkdir(parents=True, exist_ok=True)
+    corr = df.select_dtypes(include=[np.number]).corr()
+    if target_first and "cardio" in corr.columns:
+        # Reorder to show target correlations first
+        cols = ["cardio"] + [c for c in corr.columns if c != "cardio"]
+        corr = corr.loc[cols, cols]
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(corr, cmap="coolwarm", center=0, square=True)
+    plt.title("Correlation heatmap")
+    plt.tight_layout()
+    plt.savefig(figdir / "02_correlation_heatmap.png", dpi=160)
+    plt.close()
+
 
 
 def preprocess(
-    raw_path: str | Path,
-    clean_path: str | Path,
-    figs_dir: str | Path,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """
-    Load the raw cardio dataset, perform basic cleaning/feature engineering, save a
-    cleaned CSV, and produce a few diagnostic plots.
-    """
-    raw_path = Path(raw_path)
-    clean_path = Path(clean_path)
-    figs_dir = Path(figs_dir)
+    input_csv: Path,
+    output_csv: Path,
+    figdir: Path | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    df = load_raw(input_csv)
+    df = basic_sanity_fixes(df)
+    df = add_features(df)
 
-    if not raw_path.exists():
-        raise FileNotFoundError(f"Raw dataset not found at {raw_path}")
+    
+    if figdir is not None:                     #  EDA before scaling        
+        pre_dir = figdir / "pre_scale"
+        pre_dir.mkdir(parents=True, exist_ok=True)
+        save_class_balance(df, pre_dir)
+        save_histograms(df, pre_dir, ["age", "bmi", "ap_hi", "ap_lo", "pulse_pressure"])
+        save_corr_heatmap(df, pre_dir)
 
-    clean_path.parent.mkdir(parents=True, exist_ok=True)
-    figs_dir.mkdir(parents=True, exist_ok=True)
+    stats = class_ratio(df, target="cardio")               # class stats (before scaling)
+    if figdir is not None:
+        summary_path = figdir / "00_summary.txt"
+        with open(summary_path, "w") as f:
+            f.write(
+                f"Rows after cleaning: {len(df)}\n"
+                f"Class counts -> 0: {stats['neg']}, 1: {stats['pos']}, Total: {stats['total']}\n"
+                f"Positive class %: {stats['pos_pct']}%\n"
+            )
 
-    df = pd.read_csv(raw_path, sep=";")
+   
+    cols_to_scale = ["age", "height", "weight", "ap_hi", "ap_lo", "bmi", "pulse_pressure"]   # columns post EDA 
+    df, _ = impute_and_scale(df, cols_to_scale)
 
-    df["age"] = (df["age"] / 365.25).round().astype(int)
-    df["bmi"] = (df["weight"] / ((df["height"] / 100) ** 2)).round(1)
-    df["pulse_pressure"] = df["ap_hi"] - df["ap_lo"]
+    # heatmap after scaling:
+    # if figdir is not None:
+    #     post_dir = figdir / "post_scale"
+    #     post_dir.mkdir(parents=True, exist_ok=True)
+    #     save_corr_heatmap(df, post_dir)
 
-    valid_height = df["height"].between(120, 210)
-    valid_weight = df["weight"].between(40, 200)
-    valid_ap_hi = df["ap_hi"].between(80, 250)
-    valid_ap_lo = df["ap_lo"].between(40, 200)
-    valid_ap_relation = df["ap_hi"] >= df["ap_lo"]
-    valid_pulse = df["pulse_pressure"] >= 0
+    
+    output_csv.parent.mkdir(parents=True, exist_ok=True)                     # save cleaned data
+    df.to_csv(output_csv, index=False)
 
-    df = df[
-        valid_height
-        & valid_weight
-        & valid_ap_hi
-        & valid_ap_lo
-        & valid_ap_relation
-        & valid_pulse
-    ].copy()
-
-    df = df.drop_duplicates()
-
-    df.to_csv(clean_path, index=False)
-
-    stats = _class_balance(df)
-
-    _render_figures(df, figs_dir)
-
+    print(                                                                  # Print a one-liner for the report log
+        f"[CLEAN] rows={len(df)} | class 0={stats['neg']} | class 1={stats['pos']} "
+        f"({stats['pos_pct']}% positive)"
+    )
     return df, stats
 
 
-def _class_balance(df: pd.DataFrame) -> Dict[str, float]:
-    pos = int(df["cardio"].sum())
-    total = int(len(df))
-    neg = total - pos
-    pos_pct = round((pos / total) * 100, 2) if total else 0.0
-    return {"pos": pos, "neg": neg, "pos_pct": pos_pct}
+def cli():
+    parser = argparse.ArgumentParser(description="Clean & explore the cardio dataset.")
+    parser.add_argument("--input", type=Path, default=Path("Dataset/cardio_train.csv"))
+    parser.add_argument("--output", type=Path, default=Path("Dataset/cardio_clean.csv"))
+    parser.add_argument("--figdir", type=Path, default=Path("Dataset/figures"))
+    args = parser.parse_args()
+
+    preprocess(args.input, args.output, args.figdir)
+    print(f"✔ Saved cleaned data to: {args.output}")
+    print(f"✔ Figures (EDA) saved to: {args.figdir}")
 
 
-def _render_figures(df: pd.DataFrame, figs_dir: Path) -> None:
-    sns.set_theme(style="whitegrid")
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    sns.histplot(df["age"], bins=25, ax=axes[0], kde=True, color="#1f77b4")
-    axes[0].set_title("Age Distribution (years)")
-    axes[0].set_xlabel("Age")
-
-    sns.histplot(df["bmi"], bins=25, ax=axes[1], kde=True, color="#ff7f0e")
-    axes[1].set_title("BMI Distribution")
-    axes[1].set_xlabel("BMI")
-
-    fig.tight_layout()
-    fig.savefig(figs_dir / "age_bmi_distribution.png", dpi=150)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(4, 4))
-    sns.countplot(data=df, x="cardio", ax=ax, palette="Set2")
-    ax.set_title("Cardio Label Counts")
-    ax.set_xlabel("cardio (0=No, 1=Yes)")
-    ax.set_ylabel("Count")
-    fig.tight_layout()
-    fig.savefig(figs_dir / "cardio_label_counts.png", dpi=150)
-    plt.close(fig)
+if __name__ == "__main__":
+    cli()
